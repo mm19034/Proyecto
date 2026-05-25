@@ -1,0 +1,1042 @@
+<?php
+date_default_timezone_set('America/El_Salvador');
+require 'includes/auth_check.php';
+require 'includes/config.php';
+
+// Para enviar facturas por correo
+use PHPMailer\PHPMailer\PHPMailer;
+use PHPMailer\PHPMailer\Exception;
+require 'includes/PHPMailer/src/Exception.php';
+require 'includes/PHPMailer/src/PHPMailer.php';
+require 'includes/PHPMailer/src/SMTP.php';
+
+// Para generar PDF (DomPDF manual)
+require 'includes/dompdf/autoload.inc.php';
+use Dompdf\Dompdf;
+use Dompdf\Options;
+
+// Solo vendedor y admin
+if (!in_array($_SESSION['rol'], ['admin', 'vendedor'])) {
+    header("Location: dashboard.php");
+    exit();
+}
+
+$error = $success = '';
+
+// ----------------------------
+// OBTENER DATOS DE LA EMPRESA
+// ----------------------------
+$empresa = $pdo->query("SELECT * FROM empresa LIMIT 1")->fetch(PDO::FETCH_ASSOC);
+$iva_porcentaje = (float)($empresa['iva_porcentaje'] ?? 13);
+
+// ----------------------------
+// INICIALIZAR CARRITO EN SESIÓN
+// ----------------------------
+if (!isset($_SESSION['carrito'])) {
+    $_SESSION['carrito'] = [];
+}
+
+// ----------------------------
+// LISTAR VENTAS (modo tabla)
+// ----------------------------
+$modo = $_GET['modo'] ?? 'nueva';
+if ($modo === 'lista') {
+    $busqueda = $_GET['busqueda'] ?? '';
+    $por_pagina = 20;
+    $pagina = max(1, (int)($_GET['pagina'] ?? 1));
+    $offset = ($pagina - 1) * $por_pagina;
+
+    $where = '';
+    $params = [];
+    if ($busqueda) {
+        $where = "WHERE v.codigo_venta LIKE ? OR c.nombre LIKE ?";
+        $params = ["%$busqueda%", "%$busqueda%"];
+    }
+
+    // Total de ventas
+    $stmt = $pdo->prepare("SELECT COUNT(*) FROM ventas v LEFT JOIN clientes c ON v.cliente_id = c.id $where");
+    $stmt->execute($params);
+    $total_ventas = $stmt->fetchColumn();
+    $total_paginas = ceil($total_ventas / $por_pagina);
+
+    // Ventas con paginación
+    $stmt = $pdo->prepare("
+        SELECT v.*, c.nombre as cliente_nombre, u.nombre as vendedor
+        FROM ventas v
+        LEFT JOIN clientes c ON v.cliente_id = c.id
+        LEFT JOIN usuarios u ON v.usuario_id = u.id
+        $where
+        ORDER BY v.fecha DESC
+        LIMIT $por_pagina OFFSET $offset
+    ");
+    $stmt->execute($params);
+    $ventas = $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+// ----------------------------
+// VER DETALLE DE VENTA (modo API)
+// ----------------------------
+if (isset($_GET['detalle'])) {
+    $venta_id = (int)$_GET['detalle'];
+
+    $stmt = $pdo->prepare("
+        SELECT v.*, c.nombre as cliente_nombre, u.nombre as vendedor,
+               e.nombre as empresa_nombre, e.nit, e.direccion
+        FROM ventas v
+        LEFT JOIN clientes c ON v.cliente_id = c.id
+        LEFT JOIN usuarios u ON v.usuario_id = u.id
+        LEFT JOIN empresa e ON 1=1
+        WHERE v.id = ?
+    ");
+    $stmt->execute([$venta_id]);
+    $venta_detalle = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$venta_detalle) {
+        echo "<div class='alert alert-danger'>Venta no encontrada.</div>";
+        exit();
+    }
+
+    $stmt = $pdo->prepare("
+        SELECT dv.*, p.nombre as producto_nombre
+        FROM detalle_ventas dv
+        JOIN productos p ON dv.producto_id = p.id
+        WHERE dv.venta_id = ?
+    ");
+    $stmt->execute([$venta_id]);
+    $venta_detalle['items'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // ===== SOLO HTML DEL MODAL =====
+    ob_start();
+    ?>
+    <div class="ticket-print">
+        <div class="ticket-header text-center">
+            <?php if (!empty($empresa['logo_url']) && file_exists($empresa['logo_url'])): ?>
+                <?php
+                $logo_url = 'http://' . $_SERVER['HTTP_HOST'] . '/sgipos/' . $empresa['logo_url'];
+                ?>
+                <img src="<?= htmlspecialchars($logo_url) ?>" alt="Logo" style="max-height: 60px;">
+            <?php endif; ?>
+            <h4><?= htmlspecialchars($venta_detalle['empresa_nombre']) ?></h4>
+            <p><?= htmlspecialchars($venta_detalle['direccion']) ?></p>
+            <p>NIT: <?= htmlspecialchars($venta_detalle['nit']) ?></p>
+            <hr>
+            <h5>FACTURA ELECTRÓNICA</h5>
+            <p><strong><?= htmlspecialchars($venta_detalle['numero_factura'] ?? $venta_detalle['codigo_venta']) ?></strong></p>
+            <p><?= date('d/m/Y H:i', strtotime($venta_detalle['fecha'])) ?></p>
+        </div>
+        <p><strong>Cliente:</strong> <?= htmlspecialchars($venta_detalle['cliente_nombre'] ?? 'Genérico') ?></p>
+        <p><strong>Vendedor:</strong> <?= htmlspecialchars($venta_detalle['vendedor']) ?></p>
+        <p><strong>Método:</strong> <?= ucfirst($venta_detalle['metodo_pago']) ?></p>
+        <hr>
+        <?php foreach ($venta_detalle['items'] as $i): ?>
+            <div class="ticket-line">
+                <span><?= $i['cantidad'] ?>x <?= htmlspecialchars($i['producto_nombre']) ?></span>
+                <span>$<?= number_format($i['subtotal'], 2) ?></span>
+            </div>
+        <?php endforeach; ?>
+        <hr>
+        <div class="ticket-line">
+            <span>Subtotal</span>
+            <span>$<?= number_format($venta_detalle['subtotal'], 2) ?></span>
+        </div>
+        <div class="ticket-line">
+            <span>IVA</span>
+            <span>$<?= number_format($venta_detalle['iva_aplicado'], 2) ?></span>
+        </div>
+        <div class="ticket-line ticket-total">
+            <span>TOTAL</span>
+            <span>$<?= number_format($venta_detalle['total'], 2) ?></span>
+        </div>
+        <div class="text-center mt-3">
+            <button class="btn btn-primary" onclick="window.print()">Imprimir</button>
+            <a href="tickets/ticket_<?= htmlspecialchars($venta_detalle['codigo_venta']) ?>.pdf"
+               target="_blank" class="btn btn-success ms-2">
+                <i class="fas fa-file"></i> Archivo
+            </a>
+        </div>
+    </div>
+    <?php
+    echo ob_get_clean();
+    exit();
+}
+
+// ----------------------------
+// AGREGAR PRODUCTO AL CARRITO
+// ----------------------------
+if (isset($_POST['agregar_producto'])) {
+    $producto_id = (int)$_POST['producto_id'];
+    $cantidad = (int)$_POST['cantidad'];
+
+    if ($producto_id && $cantidad > 0) {
+        $stmt = $pdo->prepare("
+            SELECT p.id, p.nombre, p.precio_venta, p.stock,
+                   d.tipo as descuento_tipo, d.valor as descuento_valor
+            FROM productos p
+            LEFT JOIN descuentos d ON p.id = d.producto_id 
+                AND d.activo = 1 
+                AND (d.fecha_fin IS NULL OR d.fecha_fin >= CURDATE())
+            WHERE p.id = ? AND p.estado = 'activo'
+        ");
+        $stmt->execute([$producto_id]);
+        $producto = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($producto && $cantidad <= $producto['stock']) {
+            $existe = false;
+            foreach ($_SESSION['carrito'] as &$item) {
+                if ($item['id'] == $producto_id) {
+                    $item['cantidad'] += $cantidad;
+                    if ($item['cantidad'] > $producto['stock']) {
+                        $item['cantidad'] = $producto['stock'];
+                    }
+                    $existe = true;
+                    break;
+                }
+            }
+            if (!$existe) {
+                $descuento_aplicado = 0;
+                if ($producto['descuento_tipo']) {
+                    if ($producto['descuento_tipo'] === 'porcentaje') {
+                        $descuento_aplicado = $producto['precio_venta'] * ($producto['descuento_valor'] / 100);
+                    } else {
+                        $descuento_aplicado = $producto['descuento_valor'];
+                    }
+                    $descuento_aplicado = min($descuento_aplicado, $producto['precio_venta']);
+                }
+
+                $_SESSION['carrito'][] = [
+                    'id' => $producto_id,
+                    'nombre' => $producto['nombre'],
+                    'precio' => (float)$producto['precio_venta'],
+                    'cantidad' => $cantidad,
+                    'descuento' => (float)$descuento_aplicado
+                ];
+            }
+            header("Location: ventas.php");
+            exit();
+        } else {
+            $error = "Producto no disponible o stock insuficiente.";
+        }
+    }
+}
+
+// ----------------------------
+// ELIMINAR PRODUCTO DEL CARRITO
+// ----------------------------
+if (isset($_GET['eliminar_item'])) {
+    $index = (int)$_GET['eliminar_item'];
+    if (isset($_SESSION['carrito'][$index])) {
+        unset($_SESSION['carrito'][$index]);
+        $_SESSION['carrito'] = array_values($_SESSION['carrito']);
+    }
+    header("Location: ventas.php");
+    exit();
+}
+
+// ----------------------------
+// PROCESAR VENTA
+// ----------------------------
+if (isset($_POST['procesar_venta'])) {
+    if (empty($_SESSION['carrito'])) {
+        $error = "El carrito está vacío.";
+    } else {
+        try {
+            $pdo->beginTransaction();
+
+            $cliente_id = !empty($_POST['cliente_id']) ? (int)$_POST['cliente_id'] : null;
+            $nuevo_cliente_nombre = trim($_POST['nuevo_cliente_nombre'] ?? '');
+            $nuevo_cliente_email = trim($_POST['nuevo_cliente_email'] ?? '');
+
+            if ($cliente_id === null && $nuevo_cliente_nombre) {
+                $stmt = $pdo->prepare("INSERT INTO clientes (nombre, email) VALUES (?, ?)");
+                $stmt->execute([$nuevo_cliente_nombre, $nuevo_cliente_email]);
+                $cliente_id = $pdo->lastInsertId();
+            }
+
+            // Obtener nombre real del cliente
+            $cliente_nombre = 'Cliente genérico';
+            if ($cliente_id) {
+                $stmt = $pdo->prepare("SELECT nombre FROM clientes WHERE id = ?");
+                $stmt->execute([$cliente_id]);
+                $cliente_row = $stmt->fetch();
+                if ($cliente_row) {
+                    $cliente_nombre = $cliente_row['nombre'];
+                }
+            } elseif ($nuevo_cliente_nombre) {
+                $cliente_nombre = $nuevo_cliente_nombre;
+            }
+
+            $metodo_pago = $_POST['metodo_pago'] ?? 'efectivo';
+            $referencia = trim($_POST['referencia'] ?? '');
+
+            $subtotal = 0;
+            $descuento_total = 0;
+            foreach ($_SESSION['carrito'] as $item) {
+                $item_total = $item['precio'] * $item['cantidad'];
+                $descuento_item = $item['descuento'] * $item['cantidad'];
+                $subtotal += $item_total;
+                $descuento_total += $descuento_item;
+            }
+            $subtotal_con_descuento = $subtotal - $descuento_total;
+            $iva = $subtotal_con_descuento * ($iva_porcentaje / 100);
+            $total = $subtotal_con_descuento + $iva;
+
+            $fecha_venta = date('Y-m-d H:i:s');
+            $codigo_venta = 'VTA-' . date('Ymd') . '-' . str_pad(mt_rand(1, 9999), 4, '0', STR_PAD_LEFT);
+
+            // ✅ Generar número de factura correlativo
+            $prefijo = $empresa['prefijo_factura'] ?? 'FAC';
+            $nuevo_numero = $empresa['ultimo_numero_factura'] ?? 1;
+            $numero_factura = $prefijo . '-' . str_pad($nuevo_numero, 6, '0', STR_PAD_LEFT);
+
+            $stmt = $pdo->prepare("
+                INSERT INTO ventas (
+                    cliente_id, usuario_id, codigo_venta, numero_factura, subtotal, iva_aplicado, 
+                    descuento_total, total, metodo_pago, referencia_pago, estado, fecha
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completada', ?)
+            ");
+            $stmt->execute([
+                $cliente_id, 
+                $_SESSION['usuario_id'], 
+                $codigo_venta,
+                $numero_factura,
+                $subtotal, 
+                $iva, 
+                $descuento_total, 
+                $total,
+                $metodo_pago, 
+                $referencia,
+                $fecha_venta
+            ]);
+            $venta_id = $pdo->lastInsertId();
+
+            // ✅ Actualizar último número de factura
+            $pdo->prepare("UPDATE empresa SET ultimo_numero_factura = ? WHERE id = ?")
+                 ->execute([$nuevo_numero + 1, $empresa['id']]);
+
+            foreach ($_SESSION['carrito'] as $item) {
+                $stmt = $pdo->prepare("
+                    INSERT INTO detalle_ventas (
+                        venta_id, producto_id, cantidad, precio_unitario, 
+                        descuento_aplicado, subtotal
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                ");
+                $subtotal_item = ($item['precio'] - $item['descuento']) * $item['cantidad'];
+                $stmt->execute([
+                    $venta_id, $item['id'], $item['cantidad'],
+                    $item['precio'], $item['descuento'], $subtotal_item
+                ]);
+
+                $pdo->prepare("UPDATE productos SET stock = stock - ? WHERE id = ?")
+                     ->execute([$item['cantidad'], $item['id']]);
+            }
+
+            // ===== GENERAR PDF =====
+            $pdf_content = generarFacturaPDF(
+                $venta_id,
+                $numero_factura,
+                $codigo_venta,
+                $fecha_venta,
+                $total,
+                $_SESSION['carrito'],
+                $cliente_nombre,
+                $metodo_pago,
+                $iva,
+                $iva_porcentaje,
+                $empresa
+            );
+
+            // ===== ENVIAR POR CORREO =====
+            $email_cliente = null;
+            if ($cliente_id) {
+                $stmt = $pdo->prepare("SELECT email FROM clientes WHERE id = ?");
+                $stmt->execute([$cliente_id]);
+                $cliente_row = $stmt->fetch();
+                $email_cliente = $cliente_row ? $cliente_row['email'] : null;
+            } elseif ($nuevo_cliente_email) {
+                $email_cliente = $nuevo_cliente_email;
+            }
+
+            if ($email_cliente) {
+                $mail = new PHPMailer(true);
+                try {
+                    // Configuración SMTP (ejemplo con Gmail)
+                    $mail->isSMTP();
+                    $mail->Host       = 'smtp.gmail.com';
+                    $mail->SMTPAuth   = true;
+                    $mail->Username   = 'sgipos.sistema@gmail.com';   // Tu correo
+                    $mail->Password   = 'yygk zazu jjzf vgez';     // Contraseña de app
+                    $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
+                    $mail->Port       = 587;
+
+                    $mail->setFrom('sgipos.sistema@gmail.com', 'SGI-POS');
+                    $mail->addAddress($email_cliente, $cliente_nombre);
+
+                    $mail->isHTML(true);
+                    $mail->CharSet = 'UTF-8';
+                    $mail->Subject = "Factura Electrónica - {$numero_factura}";
+                    $mail->Body    = "
+                        <p>Hola {$cliente_nombre},</p>
+                        <p>Adjuntamos su factura electrónica.</p>
+                        <p>Gracias por su compra.</p>
+                        <p>Saludos,</p>
+                        <p>Equipo SGI-POS</p>
+                    ";
+                    $mail->addStringAttachment($pdf_content, "factura_{$numero_factura}.pdf", 'base64', 'application/pdf');
+
+                    $mail->send();
+                    $success .= " Factura enviada a {$email_cliente}.";
+                } catch (Exception $e) {
+                    error_log("Error al enviar factura: " . $mail->ErrorInfo);
+                    $error = "No se pudo enviar la factura por correo.";
+                }
+            }
+
+            // ===== GUARDAR PDF EN ARCHIVO =====
+            $nombre_pdf = "ticket_{$codigo_venta}.pdf";
+            file_put_contents("tickets/{$nombre_pdf}", $pdf_content);
+
+            // ===== GUARDAR EN SESIÓN =====
+            $_SESSION['ticket_venta'] = [
+                'numero_factura' => $numero_factura,
+                'codigo' => $codigo_venta,
+                'fecha' => $fecha_venta,
+                'total' => $total,
+                'items' => $_SESSION['carrito'],
+                'cliente_nombre' => $cliente_nombre,
+                'metodo_pago' => $metodo_pago,
+                'iva' => $iva,
+                'iva_porcentaje' => $iva_porcentaje,
+                'empresa' => $empresa,
+                'archivo' => $nombre_pdf
+            ];
+
+            unset($_SESSION['carrito']);
+            $pdo->commit();
+            header("Location: ventas.php?ticket=1");
+            exit();
+
+        } catch (Exception $e) {
+            $pdo->rollback();
+            $error = "Error al procesar la venta: " . $e->getMessage();
+        }
+    }
+}
+
+// ----------------------------
+// CARGAR DATOS PARA LA VISTA
+// ----------------------------
+$clientes = $pdo->query("SELECT id, nombre FROM clientes ORDER BY nombre")->fetchAll();
+$productos = $pdo->query("
+    SELECT p.id, p.nombre, p.precio_venta, p.stock,
+           (SELECT ruta_imagen FROM imagenes_productos WHERE producto_id = p.id ORDER BY orden LIMIT 1) as imagen
+    FROM productos p
+    WHERE p.estado = 'activo' AND p.stock > 0
+    ORDER BY p.id DESC
+    LIMIT 20
+")->fetchAll();
+
+$ticket = $_SESSION['ticket_venta'] ?? null;
+if (isset($_GET['ticket']) && $ticket) {
+    unset($_SESSION['ticket_venta']);
+}
+
+function generarFacturaPDF($venta_id, $numero_factura, $codigo_venta, $fecha, $total, $items, $cliente_nombre, $metodo_pago, $iva, $iva_porcentaje, $empresa) {
+    ob_start();
+    ?>
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>Factura <?= htmlspecialchars($numero_factura) ?></title>
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #fff; }
+            .header { text-align: center; margin-bottom: 20px; }
+            .header img { max-height: 60px; width: auto; object-fit: contain; vertical-align: middle; }
+            .line { display: flex; justify-content: space-between; margin: 5px 0; }
+            .total { font-weight: bold; margin-top: 10px; }
+            .footer { text-align: center; margin-top: 20px; font-size: 12px; color: #666; }
+            hr { margin: 10px 0; }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <?php if (!empty($empresa['logo_url']) && file_exists($empresa['logo_url'])): ?>
+                <?php
+                $image_path = __DIR__ . '/../' . $empresa['logo_url'];
+                if (file_exists($image_path)) {
+                    $image_data = file_get_contents($image_path);
+                    $image_type = mime_content_type($image_path);
+                    if (in_array($image_type, ['image/jpeg', 'image/png', 'image/webp', 'image/gif'])) {
+                        $image_base64 = 'data:' . $image_type . ';base64,' . base64_encode($image_data);
+                    } else {
+                        $image_base64 = '';
+                    }
+                } else {
+                    $image_base64 = '';
+                }
+                ?>
+                <?php if ($image_base64): ?>
+                    <img src="<?= $image_base64 ?>" alt="Logo" style="max-height: 60px;">
+                <?php endif; ?>
+            <?php endif; ?>
+            <h3><?= htmlspecialchars($empresa['nombre'] ?? 'SGI-POS') ?></h3>
+            <p><?= htmlspecialchars($empresa['direccion'] ?? '') ?></p>
+            <p>NIT: <?= htmlspecialchars($empresa['nit'] ?? '') ?></p>
+            <hr>
+            <h4>FACTURA ELECTRÓNICA</h4>
+            <p><strong><?= htmlspecialchars($numero_factura) ?></strong></p>
+            <p><strong>Fecha:</strong> <?= htmlspecialchars($fecha) ?></p>
+        </div>
+
+        <p><strong>Cliente:</strong> <?= htmlspecialchars($cliente_nombre) ?></p>
+        <p><strong>Método:</strong> <?= htmlspecialchars(ucfirst($metodo_pago)) ?></p>
+        <hr>
+
+        <?php foreach ($items as $item): ?>
+            <div class="line">
+                <span><?= (int)$item['cantidad'] ?>x <?= htmlspecialchars($item['nombre']) ?></span>
+                <span>$<?= number_format(($item['precio'] - $item['descuento']) * $item['cantidad'], 2) ?></span>
+            </div>
+        <?php endforeach; ?>
+
+        <hr>
+        <div class="line">
+            <span>Subtotal:</span>
+            <span>$<?= number_format($total / (1 + $iva_porcentaje/100), 2) ?></span>
+        </div>
+        <div class="line">
+            <span>IVA (<?= (float)$iva_porcentaje ?>%):</span>
+            <span>$<?= number_format($iva, 2) ?></span>
+        </div>
+        <div class="line total">
+            <span>TOTAL:</span>
+            <span>$<?= number_format($total, 2) ?></span>
+        </div>
+
+        <div class="footer">
+            <p>¡Gracias por su compra!</p>
+            <p>Venta ID: <?= (int)$venta_id ?></p>
+        </div>
+    </body>
+    </html>
+    <?php
+    $html = ob_get_clean();
+
+    // Configurar DomPDF
+    $options = new Options();
+    $options->set('isHtml5ParserEnabled', true);
+    $options->set('isRemoteEnabled', true);
+    $options->set('defaultFont', 'Arial');
+
+    $dompdf = new Dompdf($options);
+    $dompdf->loadHtml($html);
+    $dompdf->setPaper('A4', 'portrait');
+    $dompdf->render();
+    return $dompdf->output();
+}
+?>
+
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title><?= $modo === 'lista' ? 'Ventas - Historial' : 'Ventas - Nueva Venta' ?> - SGI-POS</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <link rel="shortcut icon" href="assets/img/favicon.ico" type="image/x-icon">
+    <link rel="icon" href="assets/img/favicon.ico" type="image/x-icon">
+    <style>
+        body { background: #f8f9fa; }
+        .sidebar { background: #fff; height: 100vh; position: sticky; top: 0; padding-top: 1.2rem; box-shadow: 0 0 10px rgba(0,0,0,0.08); }
+        .nav-link { padding: 0.75rem 1.5rem; font-weight: 500; border-radius: 8px; margin: 0.25rem 0; }
+        .nav-link.active, .nav-link:hover { background: #e9ecef; }
+        .btn-tactil { min-width: 44px; min-height: 44px; }
+        .product-card { cursor: pointer; transition: transform 0.2s; }
+        .product-card:hover { transform: scale(1.02); }
+        .cart-item { border-bottom: 1px solid #eee; padding: 12px 0; }
+        .ticket-print { background: white; padding: 20px; max-width: 600px; margin: 20px auto; }
+        .ticket-header { text-align: center; margin-bottom: 15px; }
+        .ticket-header h4 { margin: 5px 0; }
+        .ticket-line { display: flex; justify-content: space-between; }
+        .ticket-total { font-weight: bold; margin-top: 10px; }
+    </style>
+</head>
+<body>
+
+<div class="container-fluid">
+    <div class="row">
+        <!-- Sidebar -->
+        <div class="col-md-3 col-lg-2 d-none d-md-block p-0">
+            <div class="sidebar">
+                <div class="text-center p-2">
+    <?php if (!empty($_SESSION['empresa']['logo_url']) && file_exists($_SESSION['empresa']['logo_url'])): ?>
+        <div class="mb-1">
+            <img src="<?= htmlspecialchars($_SESSION['empresa']['logo_url']) ?>" 
+                 alt="Logo" 
+                 style="max-height: 50px; width: auto; object-fit: contain;">
+        </div>
+    <?php endif; ?>
+    <h6 class="mb-1"><?= htmlspecialchars($_SESSION['empresa']['nombre'] ?? 'SGI-POS') ?></h6>
+    <small class="text-muted">
+        <?= $_SESSION['rol'] == 'admin' ? 'Administrador' : 'Vendedor' ?>
+    </small>
+</div>
+                <ul class="nav flex-column px-2">
+                    <li class="nav-item"><a class="nav-link" href="dashboard.php"><i class="fas fa-tachometer-alt"></i> Dashboard</a></li>
+                    <?php if ($_SESSION['rol'] === 'admin'): ?>
+                        <li class="nav-item"><a class="nav-link" href="categorias.php"><i class="fas fa-list"></i> Categorias</a></li>
+                    <?php endif; ?>
+                    <li class="nav-item"><a class="nav-link" href="productos.php"><i class="fas fa-box"></i> Productos</a></li>
+                    <li class="nav-item"><a class="nav-link active" href="ventas.php"><i class="fas fa-shopping-cart"></i> Ventas</a></li>
+                    <li class="nav-item"><a class="nav-link" href="clientes.php"><i class="fas fa-users"></i> Clientes</a></li>
+                    <li class="nav-item"><a class="nav-link" href="reportes.php"><i class="fas fa-chart-line"></i> Reportes</a></li>
+                    <?php if ($_SESSION['rol'] === 'admin'): ?>
+                    <li class="nav-item"><a class="nav-link" href="usuarios.php"><i class="fas fa-user-shield"></i> Usuarios</a></li>
+                    <li class="nav-item"><a class="nav-link" href="configuracion.php"><i class="fas fa-cogs"></i> Configuración</a></li>
+                    <?php endif; ?>
+                    <li class="nav-item mt-3"><a class="nav-link text-danger" href="logout.php"><i class="fas fa-sign-out-alt"></i> Cerrar Sesión</a></li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Contenido principal -->
+        <div class="col-md-9 col-lg-10 p-3 p-md-4">
+
+            <?php if (isset($_GET['ticket']) && $ticket): ?>
+                <!-- Ticket de venta -->
+                <div class="ticket-print">
+                    <div class="ticket-header">
+                        <?php if (!empty($_SESSION['empresa']['logo_url']) && file_exists($_SESSION['empresa']['logo_url'])): ?>
+                            <div class="mb-1">
+                                <img src="<?= htmlspecialchars($_SESSION['empresa']['logo_url']) ?>" 
+                                     alt="Logo" 
+                                     style="max-height: 50px; width: auto; object-fit: contain;">
+                            </div>
+                        <?php endif; ?>
+                        <h4><?= htmlspecialchars($ticket['empresa']['nombre'] ?? 'SGI-POS') ?></h4>
+                        <p><?= htmlspecialchars($ticket['empresa']['direccion'] ?? '') ?></p>
+                        <p>NIT: <?= htmlspecialchars($ticket['empresa']['nit'] ?? '') ?></p>
+                        <hr>
+                        <h5>FACTURA ELECTRÓNICA</h5>
+                        <p>Factura No.: <strong><?= htmlspecialchars($ticket['numero_factura']) ?></strong></p>
+                        <p>Fecha: <?= htmlspecialchars($ticket['fecha']) ?></p>
+                    </div>
+
+                    <p>Cliente: <?= htmlspecialchars($ticket['cliente_nombre']) ?></p>
+                    <p>Método: <?= htmlspecialchars(ucfirst($ticket['metodo_pago'])) ?></p>
+                    <hr>
+
+                    <?php foreach ($ticket['items'] as $item): ?>
+                        <div class="ticket-line">
+                            <span><?= $item['cantidad'] ?>x <?= htmlspecialchars($item['nombre']) ?></span>
+                            <span>$<?= number_format(($item['precio'] - $item['descuento']) * $item['cantidad'], 2) ?></span>
+                        </div>
+                    <?php endforeach; ?>
+
+                    <hr>
+                    <div class="ticket-line">
+                        <span>Subtotal:</span>
+                        <span>$<?= number_format($ticket['total'] / (1 + $ticket['iva_porcentaje']/100), 2) ?></span>
+                    </div>
+                    <div class="ticket-line">
+                        <span>IVA (<?= $ticket['iva_porcentaje'] ?>%):</span>
+                        <span>$<?= number_format($ticket['iva'], 2) ?></span>
+                    </div>
+                    <div class="ticket-line ticket-total">
+                        <span>TOTAL:</span>
+                        <span>$<?= number_format($ticket['total'], 2) ?></span>
+                    </div>
+
+                    <div class="text-center mt-4">
+                        <p>¡Gracias por su compra!</p>
+                        <button class="btn btn-primary" onclick="window.print()">Imprimir</button>
+                        <a href="tickets/<?= htmlspecialchars($ticket['archivo']) ?>"
+                           target="_blank" class="btn btn-success ms-2">
+                            <i class="fas fa-file-pdf"></i> Descargar PDF
+                        </a>
+                        <a href="ventas.php" class="btn btn-secondary ms-2">Nueva venta</a>
+                    </div>
+                </div>
+
+            <?php elseif ($modo === 'lista'): ?>
+                <!-- LISTA DE VENTAS -->
+                <div class="d-flex justify-content-between align-items-center mb-4">
+                    <h2><i class="fas fa-history"></i> Historial de Ventas</h2>
+                    <a href="ventas.php" class="btn btn-primary">
+                        <i class="fas fa-plus"></i> Nueva Venta
+                    </a>
+                </div>
+
+                <?php if ($error): ?>
+                    <div class="alert alert-danger"><?= htmlspecialchars($error) ?></div>
+                <?php endif; ?>
+
+                <!-- Búsqueda -->
+                <form method="GET" class="mb-4">
+                    <input type="hidden" name="modo" value="lista">
+                    <div class="input-group">
+                        <input type="text" class="form-control" name="busqueda" placeholder="Buscar por código o cliente..." 
+                               value="<?= htmlspecialchars($busqueda) ?>">
+                        <button class="btn btn-outline-secondary" type="submit">Buscar</button>
+                    </div>
+                </form>
+
+                <!-- Tabla de ventas -->
+                <div class="table-responsive">
+                    <table class="table table-hover">
+                        <thead class="table-light">
+                            <tr>
+                                <th>Factura</th>
+                                <th>Fecha</th>
+                                <th>Cliente</th>
+                                <th>Vendedor</th>
+                                <th>Total</th>
+                                <th>Método</th>
+                                <th class="text-end">Acciones</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php if ($ventas): ?>
+                                <?php foreach ($ventas as $v): ?>
+                                <tr>
+                                    <td><?= htmlspecialchars($v['numero_factura'] ?? $v['codigo_venta']) ?></td>
+                                    <td><?= date('d/m/Y H:i', strtotime($v['fecha'])) ?></td>
+                                    <td><?= htmlspecialchars($v['cliente_nombre'] ?? 'Genérico') ?></td>
+                                    <td><?= htmlspecialchars($v['vendedor']) ?></td>
+                                    <td>$<?= number_format($v['total'], 2) ?></td>
+                                    <td><?= ucfirst($v['metodo_pago']) ?></td>
+                                    <td class="text-end">
+                                        <button type="button" class="btn btn-sm btn-outline-primary"
+                                                onclick="verDetalleVenta(<?= $v['id'] ?>)">
+                                            <i class="fas fa-eye"></i>
+                                        </button>
+                                    </td>
+                                </tr>
+                                <?php endforeach; ?>
+                            <?php else: ?>
+                                <tr>
+                                    <td colspan="7" class="text-center">No hay ventas registradas.</td>
+                                </tr>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+
+                <?php if ($total_paginas > 1): ?>
+                <nav class="mt-3">
+                    <ul class="pagination justify-content-center">
+                        <?php for ($i = 1; $i <= $total_paginas; $i++): ?>
+                            <li class="page-item <?= $i == $pagina ? 'active' : '' ?>">
+                                <a class="page-link" href="?modo=lista&pagina=<?= $i ?>&busqueda=<?= urlencode($busqueda) ?>">
+                                    <?= $i ?>
+                                </a>
+                            </li>
+                        <?php endfor; ?>
+                    </ul>
+                </nav>
+                <?php endif; ?>
+
+            <?php else: ?>
+                <!-- VISTA NORMAL DE VENTAS -->
+                <div class="d-flex justify-content-between align-items-center mb-4">
+                    <h2><i class="fas fa-shopping-cart"></i> Nueva Venta</h2>
+                    <a href="ventas.php?modo=lista" class="btn btn-outline-secondary">
+                        <i class="fas fa-history"></i> Ver historial
+                    </a>
+                </div>
+
+                <?php if ($error): ?>
+                    <div class="alert alert-danger"><?= htmlspecialchars($error) ?></div>
+                <?php endif; ?>
+
+                <div class="row">
+                    <!-- Panel izquierdo: Productos -->
+                    <div class="col-lg-7 mb-4">
+                        <h5><i class="fas fa-box-open"></i> Productos</h5>
+                        <div class="input-group mb-3">
+                            <input type="text" class="form-control" id="buscarProducto" placeholder="Buscar producto...">
+                            <button class="btn btn-outline-secondary" type="button" id="btnBuscar">
+                                <i class="fas fa-search"></i>
+                            </button>
+                        </div>
+                        <div class="row g-3" id="productosList">
+                            <?php foreach ($productos as $p): ?>
+                            <div class="col-6 col-md-4 col-lg-3">
+                                <div class="card product-card" data-id="<?= $p['id'] ?>" data-nombre="<?= htmlspecialchars($p['nombre']) ?>" data-precio="<?= $p['precio_venta'] ?>">
+                                    <div style="height: 100px; display: flex; align-items: center; justify-content: center; background: #f8f9fa;">
+                                        <?php if ($p['imagen']): ?>
+                                            <img src="uploads/productos/<?= htmlspecialchars($p['imagen']) ?>" 
+                                                 style="max-height: 80px; max-width: 100%; object-fit: contain;">
+                                        <?php else: ?>
+                                            <i class="fas fa-box text-muted" style="font-size: 2rem;"></i>
+                                        <?php endif; ?>
+                                    </div>
+                                    <div class="card-body p-2 text-center">
+                                        <div class="small"><?= htmlspecialchars(substr($p['nombre'], 0, 20)) ?>...</div>
+                                        <div class="fw-bold">$<?= number_format($p['precio_venta'], 2) ?></div>
+                                        <div class="text-muted small">Stock: <?= $p['stock'] ?></div>
+                                    </div>
+                                </div>
+                            </div>
+                            <?php endforeach; ?>
+                        </div>
+                    </div>
+
+                    <!-- Panel derecho: Carrito y cliente -->
+                    <div class="col-lg-5">
+                        <!-- Cliente -->
+                        <div class="card mb-4">
+                            <div class="card-header">
+                                <h6><i class="fas fa-user"></i> Cliente</h6>
+                            </div>
+                            <div class="card-body">
+                                <form id="formCliente">
+                                    <select name="cliente_id" class="form-select mb-2">
+                                        <option value="">-- Seleccionar cliente --</option>
+                                        <?php foreach ($clientes as $c): ?>
+                                            <option value="<?= $c['id'] ?>"><?= htmlspecialchars($c['nombre']) ?></option>
+                                        <?php endforeach; ?>
+                                    </select>
+                                    <div class="mb-2">
+                                        <input type="text" name="nuevo_cliente_nombre" class="form-control" placeholder="Nombre (cliente nuevo)">
+                                    </div>
+                                    <div class="mb-2">
+                                        <input type="email" name="nuevo_cliente_email" class="form-control" placeholder="Email (opcional)">
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+
+                        <!-- Carrito -->
+                        <div class="card mb-4">
+                            <div class="card-header d-flex justify-content-between">
+                                <h6><i class="fas fa-cart-shopping"></i> Carrito</h6>
+                                <span class="badge bg-primary">
+                                    <?= count($_SESSION['carrito']) ?> ítem(s)
+                                </span>
+                            </div>
+                            <div class="card-body">
+                                <?php if (empty($_SESSION['carrito'])): ?>
+                                    <p class="text-muted">El carrito está vacío.</p>
+                                <?php else: ?>
+                                    <?php 
+                                    $total_carrito = 0;
+                                    foreach ($_SESSION['carrito'] as $index => $item):
+                                        $subtotal_item = ($item['precio'] - $item['descuento']) * $item['cantidad'];
+                                        $total_carrito += $subtotal_item;
+                                    ?>
+                                    <div class="cart-item">
+                                        <div class="d-flex justify-content-between">
+                                            <div>
+                                                <strong><?= htmlspecialchars($item['nombre']) ?></strong><br>
+                                                <small><?= $item['cantidad'] ?> x $<?= number_format($item['precio'] - $item['descuento'], 2) ?></small>
+                                                <?php if ($item['descuento'] > 0): ?>
+                                                    <br><small class="text-success">- $<?= number_format($item['descuento'], 2) ?> desc.</small>
+                                                <?php endif; ?>
+                                            </div>
+                                            <div class="text-end">
+                                                $<?= number_format($subtotal_item, 2) ?>
+                                                <a href="?eliminar_item=<?= $index ?>" class="btn btn-sm btn-outline-danger ms-2 btn-tactil">
+                                                    <i class="fas fa-trash"></i>
+                                                </a>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <?php endforeach; ?>
+
+                                    <hr>
+                                    <div class="d-flex justify-content-between fw-bold">
+                                        <span>Subtotal:</span>
+                                        <span>$<?= number_format($total_carrito, 2) ?></span>
+                                    </div>
+                                    <div class="d-flex justify-content-between">
+                                        <span>IVA (<?= $iva_porcentaje ?>%):</span>
+                                        <span>$<?= number_format($total_carrito * ($iva_porcentaje / 100), 2) ?></span>
+                                    </div>
+                                    <div class="d-flex justify-content-between fw-bold mt-2">
+                                        <span>TOTAL:</span>
+                                        <span>$<?= number_format($total_carrito * (1 + $iva_porcentaje / 100), 2) ?></span>
+                                    </div>
+                                <?php endif; ?>
+                            </div>
+                        </div>
+
+                        <!-- Método de pago y acción -->
+                        <div class="card">
+                            <div class="card-body">
+                                <div class="mb-3">
+                                    <label class="form-label">Método de pago</label>
+                                    <select name="metodo_pago" class="form-select" id="metodoPago">
+                                        <option value="efectivo">Efectivo</option>
+                                        <option value="tarjeta">Tarjeta</option>
+                                        <option value="transferencia">Transferencia</option>
+                                        <option value="billetera">Billetera digital (Tigo Money, etc.)</option>
+                                    </select>
+                                </div>
+                                <div class="mb-3" id="campoReferencia" style="display:none;">
+                                    <label class="form-label">Referencia de pago</label>
+                                    <input type="text" class="form-control" name="referencia" placeholder="Número de transacción">
+                                </div>
+                                <button class="btn btn-success w-100" id="btnProcesar" 
+                                        <?= empty($_SESSION['carrito']) ? 'disabled' : '' ?>>
+                                    <i class="fas fa-cash-register"></i> Procesar Venta
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+            <?php endif; ?>
+        </div>
+    </div>
+</div>
+
+<!-- Modal: Agregar producto con cantidad -->
+<div class="modal fade" id="modalAgregar" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="modalTitulo">Agregar producto</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="POST">
+                <input type="hidden" name="producto_id" id="productoId">
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label">Cantidad</label>
+                        <input type="number" name="cantidad" class="form-control" value="1" min="1" max="999">
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="submit" name="agregar_producto" class="btn btn-primary">Agregar al carrito</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Modal: Detalle de venta -->
+<div class="modal fade" id="modalDetalleVenta" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Detalle de Venta</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" id="detalleVentaContent">
+                <!-- Se cargará con AJAX -->
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+    // Mostrar modal al hacer clic en producto
+    document.querySelectorAll('.product-card').forEach(card => {
+        card.addEventListener('click', () => {
+            const id = card.dataset.id;
+            const nombre = card.dataset.nombre;
+            document.getElementById('productoId').value = id;
+            document.getElementById('modalTitulo').textContent = 'Agregar: ' + nombre;
+            const modal = new bootstrap.Modal(document.getElementById('modalAgregar'));
+            modal.show();
+        });
+    });
+
+    // Búsqueda de productos
+    document.getElementById('btnBuscar').addEventListener('click', buscarProductos);
+    document.getElementById('buscarProducto').addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') buscarProductos();
+    });
+
+    function buscarProductos() {
+        const query = document.getElementById('buscarProducto').value.toLowerCase();
+        document.querySelectorAll('.product-card').forEach(card => {
+            const nombre = card.dataset.nombre.toLowerCase();
+            card.style.display = nombre.includes(query) ? 'block' : 'none';
+        });
+    }
+
+    // Mostrar campo de referencia según método de pago
+    document.getElementById('metodoPago').addEventListener('change', function() {
+        const campo = document.getElementById('campoReferencia');
+        campo.style.display = (this.value !== 'efectivo') ? 'block' : 'none';
+    });
+
+    // Formulario de procesar venta
+    document.getElementById('btnProcesar').addEventListener('click', function() {
+        const form = document.createElement('form');
+        form.method = 'POST';
+
+        const clienteId = document.querySelector('[name="cliente_id"]').value;
+        const nuevoNombre = document.querySelector('[name="nuevo_cliente_nombre"]').value;
+        const nuevoEmail = document.querySelector('[name="nuevo_cliente_email"]').value;
+        const metodo = document.getElementById('metodoPago').value;
+        const referencia = document.querySelector('[name="referencia"]')?.value || '';
+
+        const clienteIdInput = document.createElement('input');
+        clienteIdInput.type = 'hidden';
+        clienteIdInput.name = 'cliente_id';
+        clienteIdInput.value = clienteId;
+        form.appendChild(clienteIdInput);
+
+        if (nuevoNombre) {
+            const nuevoNombreInput = document.createElement('input');
+            nuevoNombreInput.type = 'hidden';
+            nuevoNombreInput.name = 'nuevo_cliente_nombre';
+            nuevoNombreInput.value = nuevoNombre;
+            form.appendChild(nuevoNombreInput);
+        }
+
+        if (nuevoEmail) {
+            const nuevoEmailInput = document.createElement('input');
+            nuevoEmailInput.type = 'hidden';
+            nuevoEmailInput.name = 'nuevo_cliente_email';
+            nuevoEmailInput.value = nuevoEmail;
+            form.appendChild(nuevoEmailInput);
+        }
+
+        const metodoInput = document.createElement('input');
+        metodoInput.type = 'hidden';
+        metodoInput.name = 'metodo_pago';
+        metodoInput.value = metodo;
+        form.appendChild(metodoInput);
+
+        if (metodo !== 'efectivo' && referencia) {
+            const refInput = document.createElement('input');
+            refInput.type = 'hidden';
+            refInput.name = 'referencia';
+            refInput.value = referencia;
+            form.appendChild(refInput);
+        }
+
+        const btnInput = document.createElement('input');
+        btnInput.type = 'hidden';
+        btnInput.name = 'procesar_venta';
+        btnInput.value = '1';
+        form.appendChild(btnInput);
+
+        document.body.appendChild(form);
+        form.submit();
+    });
+
+    // Ver detalle de venta
+    function verDetalleVenta(ventaId) {
+        fetch(`ventas.php?detalle=${ventaId}&ajax=1`)
+            .then(response => response.text())
+            .then(html => {
+                document.getElementById('detalleVentaContent').innerHTML = html;
+                const modal = new bootstrap.Modal(document.getElementById('modalDetalleVenta'));
+                modal.show();
+            })
+            .catch(err => {
+                document.getElementById('detalleVentaContent').innerHTML = '<div class="alert alert-danger">Error al cargar el detalle.</div>';
+            });
+    }
+</script>
+
+</body>
+</html>

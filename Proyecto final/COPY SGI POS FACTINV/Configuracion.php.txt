@@ -1,0 +1,290 @@
+<?php
+date_default_timezone_set('America/El_Salvador');
+require 'includes/auth_check.php';
+if ($_SESSION['rol'] !== 'admin') {
+    header("Location: dashboard.php");
+    exit();
+}
+require 'includes/config.php';
+
+$error = $success = '';
+
+// ----------------------------
+// CARGAR DATOS DE LA EMPRESA
+// ----------------------------
+$empresa = $pdo->query("SELECT * FROM empresa LIMIT 1")->fetch(PDO::FETCH_ASSOC);
+if (!$empresa) {
+    // Crear registro si no existe
+    $pdo->query("INSERT INTO empresa (nombre) VALUES ('Mi Empresa')");
+    $empresa = $pdo->query("SELECT * FROM empresa LIMIT 1")->fetch(PDO::FETCH_ASSOC);
+}
+
+// ----------------------------
+// PROCESAR ACTUALIZACIÓN
+// ----------------------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    try {
+        $nombre = trim($_POST['nombre'] ?? '');
+        $nit = trim($_POST['nit'] ?? '');
+        $direccion = trim($_POST['direccion'] ?? '');
+        $telefono = trim($_POST['telefono'] ?? '');
+        $email = trim($_POST['email_empresa'] ?? '');
+        $iva = str_replace(',', '.', $_POST['iva_porcentaje'] ?? '13');
+        $moneda = $_POST['moneda'] ?? 'USD';
+        $stock_minimo = max(0, (int)($_POST['stock_minimo'] ?? 5));
+        $prefijo_factura = trim($_POST['prefijo_factura'] ?? 'FAC');
+        $ultimo_numero_factura = max(1, (int)($_POST['ultimo_numero_factura'] ?? 1));
+
+        if (empty($nombre)) {
+            throw new Exception("El nombre de la empresa es obligatorio.");
+        }
+
+        $iva = (float)$iva;
+        if ($iva < 0 || $iva > 100) {
+            throw new Exception("El IVA debe estar entre 0 y 100.");
+        }
+
+        // Subir logo
+        $logo_url = $empresa['logo_url'];
+        if (!empty($_FILES['logo']['name'])) {
+            $upload_dir = 'uploads/empresa/';
+            if (!is_dir($upload_dir)) mkdir($upload_dir, 0777, true);
+
+            $file_name = $_FILES['logo']['name'];
+            $file_tmp = $_FILES['logo']['tmp_name'];
+            $file_ext = strtolower(pathinfo($file_name, PATHINFO_EXTENSION));
+            $allowed_ext = ['jpg', 'jpeg', 'png', 'webp', 'gif'];
+
+            if (in_array($file_ext, $allowed_ext)) {
+                if ($logo_url && file_exists($logo_url)) {
+                    unlink($logo_url);
+                }
+                $filename = 'logo.' . $file_ext;
+                if (move_uploaded_file($file_tmp, $upload_dir . $filename)) {
+                    $logo_url = $upload_dir . $filename;
+                }
+            } else {
+                throw new Exception("Formato de imagen no permitido. Use JPG, PNG, WEBP o GIF.");
+            }
+        }
+
+        // Actualizar en BD
+        $stmt = $pdo->prepare("
+            UPDATE empresa 
+            SET nombre = ?, nit = ?, direccion = ?, telefono = ?, 
+                email = ?, logo_url = ?, iva_porcentaje = ?, moneda = ?, 
+                stock_minimo = ?, prefijo_factura = ?, ultimo_numero_factura = ?
+            WHERE id = ?
+        ");
+        $stmt->execute([
+            $nombre, $nit, $direccion, $telefono, $email, $logo_url,
+            $iva, $moneda, $stock_minimo, $prefijo_factura, $ultimo_numero_factura,
+            $empresa['id']
+        ]);
+        
+        // Recargar datos
+        $empresa = $pdo->query("SELECT * FROM empresa LIMIT 1")->fetch(PDO::FETCH_ASSOC);
+        $_SESSION['empresa'] = $empresa;
+        $success = "Configuración actualizada correctamente.";
+
+    } catch (Exception $e) {
+        $error = "Error: " . $e->getMessage();
+    }
+}
+?>
+
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Configuración - <?= htmlspecialchars($empresa['nombre'] ?? 'SGI-POS') ?></title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <link rel="shortcut icon" href="assets/img/favicon.ico" type="image/x-icon">
+    <link rel="icon" href="assets/img/favicon.ico" type="image/x-icon">
+    <style>
+        body { background: #f8f9fa; }
+        .sidebar { background: #fff; height: 100vh; position: sticky; top: 0; padding-top: 1.2rem; box-shadow: 0 0 10px rgba(0,0,0,0.08); }
+        .nav-link { padding: 0.75rem 1.5rem; font-weight: 500; border-radius: 8px; margin: 0.25rem 0; }
+        .nav-link.active, .nav-link:hover { background: #e9ecef; }
+        .logo-preview { width: 100%; height: 120px; display: flex; align-items: center; justify-content: center; background: #f8f9fa; border: 2px dashed #dee2e6; border-radius: 8px; margin-bottom: 15px; }
+        .logo-preview img { max-height: 100%; max-width: 100%; object-fit: contain; }
+        .form-label { font-weight: 600; }
+        .upload-btn { cursor: pointer; }
+        .upload-btn:hover { background: #e9ecef; }
+    </style>
+</head>
+<body>
+
+<div class="container-fluid">
+    <div class="row">
+        <!-- Sidebar -->
+        <div class="col-md-3 col-lg-2 d-none d-md-block p-0">
+            <div class="sidebar">
+                <div class="text-center p-2">
+    <?php if (!empty($empresa['logo_url']) && file_exists($empresa['logo_url'])): ?>
+        <div class="mb-1">
+            <img src="<?= htmlspecialchars($empresa['logo_url']) ?>" 
+                 alt="Logo" 
+                 style="max-height: 50px; width: auto; object-fit: contain;">
+        </div>
+    <?php endif; ?>
+    <h6 class="mb-1"><?= htmlspecialchars($empresa['nombre'] ?? 'SGI-POS') ?></h6>
+    <small class="text-muted">
+        <?= $_SESSION['rol'] == 'admin' ? 'Administrador' : 'Vendedor' ?>
+    </small>
+</div>
+                <ul class="nav flex-column px-2">
+                    <li class="nav-item"><a class="nav-link" href="dashboard.php"><i class="fas fa-tachometer-alt"></i> Dashboard</a></li>
+                    <li class="nav-item"><a class="nav-link" href="categorias.php"><i class="fas fa-list"></i> Categorias</a></li>
+                    <li class="nav-item"><a class="nav-link" href="productos.php"><i class="fas fa-box"></i> Productos</a></li>
+                    <li class="nav-item"><a class="nav-link" href="ventas.php"><i class="fas fa-shopping-cart"></i> Ventas</a></li>
+                    <li class="nav-item"><a class="nav-link" href="clientes.php"><i class="fas fa-users"></i> Clientes</a></li>
+                    <li class="nav-item"><a class="nav-link" href="reportes.php"><i class="fas fa-chart-line"></i> Reportes</a></li>
+                    <?php if ($_SESSION['rol'] === 'admin'): ?>
+                    <li class="nav-item"><a class="nav-link" href="usuarios.php"><i class="fas fa-user-shield"></i> Usuarios</a></li>
+                    <li class="nav-item"><a class="nav-link active" href="configuracion.php"><i class="fas fa-cogs"></i> Configuración</a></li>
+                    <?php endif; ?>
+                    <li class="nav-item mt-3"><a class="nav-link text-danger" href="logout.php"><i class="fas fa-sign-out-alt"></i> Cerrar Sesión</a></li>
+                </ul>
+            </div>
+        </div>
+
+ 
+
+        <!-- Contenido principal -->
+        <div class="col-md-9 col-lg-10 p-3 p-md-4">
+            <h2><i class="fas fa-cogs"></i> Configuración de la Empresa</h2>
+
+            <?php if ($error): ?>
+                <div class="alert alert-danger"><?= htmlspecialchars($error) ?></div>
+            <?php endif; ?>
+            <?php if ($success): ?>
+                <div class="alert alert-success"><?= $success ?></div>
+            <?php endif; ?>
+
+            <form method="POST" enctype="multipart/form-data">
+                <div class="row">
+                    <!-- LOGO -->
+                    <div class="col-lg-4 mb-4">
+                        <div class="card">
+                            <div class="card-header">
+                                <h6><i class="fas fa-image"></i> Logo de la Empresa</h6>
+                            </div>
+                            <div class="card-body">
+                                <div class="logo-preview">
+                                    <?php if (!empty($empresa['logo_url']) && file_exists($empresa['logo_url'])): ?>
+                                        <img src="<?= htmlspecialchars($empresa['logo_url']) ?>" alt="Logo actual">
+                                    <?php else: ?>
+                                        <i class="fas fa-image text-muted" style="font-size: 3rem;"></i>
+                                    <?php endif; ?>
+                                </div>
+                                <input type="file" name="logo" id="logoInput" class="d-none" 
+                                       accept="image/jpeg, image/png, image/webp, image/gif">
+                                <button type="button" class="btn btn-outline-secondary w-100 upload-btn" 
+                                        onclick="document.getElementById('logoInput').click()">
+                                    <i class="fas fa-upload"></i> Seleccionar logo
+                                </button>
+                                <small class="form-text text-muted">Formatos: JPG, PNG, WEBP, GIF.</small>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- DATOS DE LA EMPRESA -->
+                    <div class="col-lg-8">
+                        <div class="card">
+                            <div class="card-header">
+                                <h6><i class="fas fa-building"></i> Información Fiscal y de Contacto</h6>
+                            </div>
+                            <div class="card-body">
+                                <div class="row">
+                                    <div class="col-md-6 mb-3">
+                                        <label class="form-label">Nombre de la Empresa *</label>
+                                        <input type="text" name="nombre" class="form-control" required
+                                               value="<?= htmlspecialchars($empresa['nombre'] ?? '') ?>">
+                                    </div>
+                                    <div class="col-md-6 mb-3">
+                                        <label class="form-label">NIT</label>
+                                        <input type="text" name="nit" class="form-control"
+                                               value="<?= htmlspecialchars($empresa['nit'] ?? '') ?>"
+                                               placeholder="0614-123456-123-4">
+                                    </div>
+                                    <div class="col-12 mb-3">
+                                        <label class="form-label">Dirección</label>
+                                        <textarea name="direccion" class="form-control" rows="2"><?= htmlspecialchars($empresa['direccion'] ?? '') ?></textarea>
+                                    </div>
+                                    <div class="col-md-6 mb-3">
+                                        <label class="form-label">Teléfono</label>
+                                        <input type="text" name="telefono" class="form-control"
+                                               value="<?= htmlspecialchars($empresa['telefono'] ?? '') ?>">
+                                    </div>
+                                    <div class="col-md-6 mb-3">
+                                        <label class="form-label">Correo Electrónico</label>
+                                        <input type="email" name="email_empresa" class="form-control"
+                                               value="<?= htmlspecialchars($empresa['email'] ?? '') ?>">
+                                    </div>
+                                    <div class="col-md-6 mb-3">
+                                        <label class="form-label">IVA (%) *</label>
+                                        <input type="number" step="0.01" name="iva_porcentaje" class="form-control" required
+                                               value="<?= htmlspecialchars($empresa['iva_porcentaje'] ?? '13') ?>">
+                                        <small class="form-text text-muted">En El Salvador el IVA estándar es 13%.</small>
+                                    </div>
+                                    <div class="col-md-6 mb-3">
+                                        <label class="form-label">Moneda</label>
+                                        <select name="moneda" class="form-select">
+                                            <option value="USD" <?= ($empresa['moneda'] ?? 'USD') == 'USD' ? 'selected' : '' ?>>USD ($)</option>
+                                            <option value="SVC" <?= ($empresa['moneda'] ?? 'USD') == 'SVC' ? 'selected' : '' ?>>Colón Salvadoreño (₡)</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-md-6 mb-3">
+                                        <label class="form-label">Stock mínimo para alertas</label>
+                                        <input type="number" name="stock_minimo" class="form-control" 
+                                               value="<?= (int)($empresa['stock_minimo'] ?? 5) ?>" min="0">
+                                    </div>
+                                    <div class="col-md-6 mb-3">
+                                        <label class="form-label">Prefijo de factura</label>
+                                        <input type="text" name="prefijo_factura" class="form-control" 
+                                               value="<?= htmlspecialchars($empresa['prefijo_factura'] ?? 'FAC') ?>"
+                                               placeholder="Ej: FAC, F001">
+                                    </div>
+                                    <div class="col-md-6 mb-3">
+                                        <label class="form-label">Siguiente número de factura</label>
+                                        <input type="number" name="ultimo_numero_factura" class="form-control" 
+                                               value="<?= (int)($empresa['ultimo_numero_factura'] ?? 1) ?>"
+                                               min="1">
+                                        <small class="form-text text-muted">La próxima factura será: <?= htmlspecialchars($empresa['prefijo_factura'] ?? 'FAC') ?>-<?= str_pad($empresa['ultimo_numero_factura'] ?? 1, 6, '0', STR_PAD_LEFT) ?></small>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="mt-4">
+                    <button type="submit" class="btn btn-primary">
+                        <i class="fas fa-save"></i> Guardar Configuración
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+    document.getElementById('logoInput').addEventListener('change', function(e) {
+        const preview = document.querySelector('.logo-preview');
+        const file = e.target.files[0];
+        if (file) {
+            const reader = new FileReader();
+            reader.onload = function(event) {
+                preview.innerHTML = `<img src="${event.target.result}" alt="Vista previa">`;
+            };
+            reader.readAsDataURL(file);
+        }
+    });
+</script>
+
+</body>
+</html>

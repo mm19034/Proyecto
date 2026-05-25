@@ -1,0 +1,545 @@
+<?php
+date_default_timezone_set('America/El_Salvador');
+require 'includes/auth_check.php';
+require 'includes/config.php';
+
+$error = $success = '';
+
+// ----------------------------
+// IMPORTAR PRODUCTOS DESDE CSV
+// ----------------------------
+if (isset($_POST['importar_csv'])) {
+    if (!isset($_FILES['archivo_csv']) || $_FILES['archivo_csv']['error'] !== UPLOAD_ERR_OK) {
+        $error = "Error al subir el archivo.";
+    } else {
+        $archivo = $_FILES['archivo_csv']['tmp_name'];
+        $ext = pathinfo($_FILES['archivo_csv']['name'], PATHINFO_EXTENSION);
+        if (strtolower($ext) !== 'csv') {
+            $error = "Solo se permiten archivos CSV.";
+        } else {
+            try {
+                $pdo->beginTransaction();
+                $lineas = file($archivo, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+                if (count($lineas) <= 1) {
+                    throw new Exception("El archivo CSV está vacío.");
+                }
+
+                $encabezado = str_getcsv(array_shift($lineas));
+                $campos_esperados = ['nombre', 'categoria', 'precio_compra', 'precio_venta', 'stock', 'estado', 'descripcion'];
+                if ($encabezado !== $campos_esperados) {
+                    throw new Exception("El archivo no coincide con la plantilla.");
+                }
+
+                // Cargar categorías existentes
+                $cats = $pdo->query("SELECT id, nombre FROM categorias")->fetchAll(PDO::FETCH_KEY_PAIR);
+                $cat_map = array_flip($cats); // nombre => id
+
+                $total_importados = 0;
+                $stmt = $pdo->prepare("
+                    INSERT INTO productos (nombre, descripcion, precio_compra, precio_venta, stock, categoria_id, estado)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ");
+
+                foreach ($lineas as $linea) {
+                    $fila = str_getcsv($linea);
+                    if (count($fila) !== 7) continue;
+
+                    [$nombre, $categoria, $precio_compra, $precio_venta, $stock, $estado, $descripcion] = array_map('trim', $fila);
+
+                    if (empty($nombre) || empty($precio_venta)) continue;
+
+                    $categoria_id = $cat_map[$categoria] ?? null;
+                    if (!$categoria_id) continue;
+
+                    $precio_compra = str_replace(',', '.', $precio_compra ?: '0');
+                    $precio_venta = str_replace(',', '.', $precio_venta);
+                    $stock = (int)($stock ?: 0);
+                    $estado = in_array($estado, ['activo', 'inactivo']) ? $estado : 'activo';
+
+                    $stmt->execute([$nombre, $descripcion, $precio_compra, $precio_venta, $stock, $categoria_id, $estado]);
+                    $total_importados++;
+                }
+
+                $pdo->commit();
+                $success = "¡Éxito! Se importaron $total_importados productos.";
+            } catch (Exception $e) {
+                $pdo->rollback();
+                $error = "Error al importar: " . $e->getMessage();
+            }
+        }
+    }
+}
+
+// ----------------------------
+// ACTUALIZAR STOCK
+// ----------------------------
+if (isset($_POST['actualizar_stock'])) {
+    try {
+        $producto_id = (int)($_POST['producto_id'] ?? 0);
+        $stock_aumento = (int)($_POST['stock_aumento'] ?? 0);
+
+        if ($producto_id <= 0 || $stock_aumento <= 0) {
+            throw new Exception("Producto y cantidad válida son requeridos.");
+        }
+
+        $stmt = $pdo->prepare("UPDATE productos SET stock = stock + ? WHERE id = ?");
+        $stmt->execute([$stock_aumento, $producto_id]);
+        $success = "Stock actualizado correctamente.";
+    } catch (Exception $e) {
+        $error = "Error: " . $e->getMessage();
+    }
+}
+
+// ----------------------------
+// PROCESAR FORMULARIO (CREAR/EDITAR)
+// ----------------------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['actualizar_stock']) && !isset($_POST['importar_csv'])) {
+    try {
+        $id = $_POST['id'] ?? null;
+        $nombre = trim($_POST['nombre'] ?? '');
+        $descripcion = trim($_POST['descripcion'] ?? '');
+        $categoria_id = $_POST['categoria_id'] ?? null;
+        $precio_compra = str_replace(',', '.', $_POST['precio_compra'] ?? '0');
+        $precio_venta = str_replace(',', '.', $_POST['precio_venta'] ?? '0');
+        $stock = (int)($_POST['stock'] ?? 0);
+        $estado = $_POST['estado'] ?? 'activo';
+
+        if (empty($nombre) || empty($precio_venta) || $categoria_id === null) {
+            throw new Exception("Nombre, precio de venta y categoría son obligatorios.");
+        }
+
+        $imagenes = [];
+        if (!empty($_FILES['imagenes']['name'][0])) {
+            $upload_dir = 'uploads/productos/';
+            if (!is_dir($upload_dir)) mkdir($upload_dir, 0777, true);
+
+            foreach ($_FILES['imagenes']['tmp_name'] as $key => $tmp_name) {
+                if (!empty($tmp_name)) {
+                    $ext = pathinfo($_FILES['imagenes']['name'][$key], PATHINFO_EXTENSION);
+                    $ext = strtolower($ext);
+                    if (in_array($ext, ['jpg', 'jpeg', 'png', 'webp'])) {
+                        $filename = uniqid() . '.' . $ext;
+                        if (move_uploaded_file($tmp_name, $upload_dir . $filename)) {
+                            $imagenes[] = $filename;
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($id) {
+            $stmt = $pdo->prepare("
+                UPDATE productos 
+                SET nombre = ?, descripcion = ?, precio_compra = ?, precio_venta = ?, 
+                    stock = ?, categoria_id = ?, estado = ?
+                WHERE id = ?
+            ");
+            $stmt->execute([$nombre, $descripcion, $precio_compra, $precio_venta, $stock, $categoria_id, $estado, $id]);
+
+            foreach ($imagenes as $img) {
+                $pdo->prepare("INSERT INTO imagenes_productos (producto_id, ruta_imagen) VALUES (?, ?)")
+                     ->execute([$id, $img]);
+            }
+
+            $success = "Producto actualizado correctamente.";
+            // Redirigir para evitar reabrir modal
+            header("Location: productos.php?exito=1");
+            exit();
+
+        } else {
+            $pdo->beginTransaction();
+            $stmt = $pdo->prepare("
+                INSERT INTO productos (nombre, descripcion, precio_compra, precio_venta, stock, categoria_id, estado)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ");
+            $stmt->execute([$nombre, $descripcion, $precio_compra, $precio_venta, $stock, $categoria_id, $estado]);
+            $producto_id = $pdo->lastInsertId();
+
+            foreach ($imagenes as $img) {
+                $pdo->prepare("INSERT INTO imagenes_productos (producto_id, ruta_imagen) VALUES (?, ?)")
+                     ->execute([$producto_id, $img]);
+            }
+            $pdo->commit();
+            $success = "Producto creado correctamente.";
+        }
+
+    } catch (Exception $e) {
+        $error = "Error: " . $e->getMessage();
+    }
+}
+
+// ----------------------------
+// ELIMINAR producto
+// ----------------------------
+if (isset($_GET['eliminar'])) {
+    $id = (int)$_GET['eliminar'];
+    $stmt = $pdo->prepare("SELECT ruta_imagen FROM imagenes_productos WHERE producto_id = ?");
+    $stmt->execute([$id]);
+    while ($img = $stmt->fetch()) {
+        $path = 'uploads/productos/' . $img['ruta_imagen'];
+        if (file_exists($path)) unlink($path);
+    }
+    $pdo->prepare("DELETE FROM productos WHERE id = ?")->execute([$id]);
+    header("Location: productos.php?eliminado=1");
+    exit();
+}
+
+// ----------------------------
+// Cargar datos para edición
+// ----------------------------
+$producto_edit = null;
+if (isset($_GET['editar'])) {
+    $stmt = $pdo->prepare("SELECT * FROM productos WHERE id = ?");
+    $stmt->execute([(int)$_GET['editar']]);
+    $producto_edit = $stmt->fetch(PDO::FETCH_ASSOC);
+}
+
+// ----------------------------
+// Cargar listado
+// ----------------------------
+$busqueda = $_GET['busqueda'] ?? '';
+$where = '';
+$params = [];
+if ($busqueda) {
+    $where = "WHERE (p.nombre LIKE ? OR p.descripcion LIKE ?)";
+    $params = ["%$busqueda%", "%$busqueda%"];
+}
+
+$stmt = $pdo->prepare("
+    SELECT p.*, c.nombre as categoria_nombre,
+           (SELECT ruta_imagen FROM imagenes_productos WHERE producto_id = p.id ORDER BY orden LIMIT 1) as imagen_principal
+    FROM productos p
+    LEFT JOIN categorias c ON p.categoria_id = c.id
+    $where
+    ORDER BY p.id DESC
+");
+$stmt->execute($params);
+$productos = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// Cargar categorías
+$categorias = $pdo->query("SELECT id, nombre FROM categorias ORDER BY nombre")->fetchAll();
+
+// Datos de empresa para stock mínimo
+$empresa = $pdo->query("SELECT stock_minimo FROM empresa LIMIT 1")->fetch(PDO::FETCH_ASSOC);
+$stock_minimo = (int)($empresa['stock_minimo'] ?? 5);
+?>
+
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Productos - SGI-POS</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <link rel="shortcut icon" href="assets/img/favicon.ico" type="image/x-icon">
+    <link rel="icon" href="assets/img/favicon.ico" type="image/x-icon">
+    <style>
+        body { background: #f8f9fa; }
+        .sidebar { background: #fff; height: 100vh; position: sticky; top: 0; padding-top: 1.2rem; box-shadow: 0 0 10px rgba(0,0,0,0.08); }
+        .nav-link { padding: 0.75rem 1.5rem; font-weight: 500; border-radius: 8px; margin: 0.25rem 0; }
+        .nav-link.active, .nav-link:hover { background: #e9ecef; }
+        .card-img-top { height: 120px; object-fit: contain; background: #fff; padding: 10px; }
+        .btn-tactil { min-width: 44px; min-height: 44px; }
+        .form-label { font-weight: 600; margin-top: 12px; }
+    </style>
+</head>
+<body>
+
+<div class="container-fluid">
+    <div class="row">
+        <!-- Sidebar -->
+        <div class="col-md-3 col-lg-2 d-none d-md-block p-0">
+            <div class="sidebar">
+                <div class="text-center p-2">
+                    <?php if (!empty($_SESSION['empresa']['logo_url']) && file_exists($_SESSION['empresa']['logo_url'])): ?>
+                        <div class="mb-1">
+                            <img src="<?= htmlspecialchars($_SESSION['empresa']['logo_url']) ?>" 
+                                alt="Logo" 
+                                style="max-height: 50px; width: auto; object-fit: contain;">
+                        </div>
+                    <?php endif; ?>
+                    <h6 class="mb-1"><?= htmlspecialchars($_SESSION['empresa']['nombre'] ?? 'SGI-POS') ?></h6>
+                    <small class="text-muted">
+                        <?= $_SESSION['rol'] == 'admin' ? 'Administrador' : 'Vendedor' ?>
+                    </small>
+                </div>
+                <ul class="nav flex-column px-2">
+                    <li class="nav-item"><a class="nav-link" href="dashboard.php"><i class="fas fa-tachometer-alt"></i> Dashboard</a></li>
+                    <?php if ($_SESSION['rol'] === 'admin'): ?>
+                    <li class="nav-item"><a class="nav-link" href="categorias.php"><i class="fas fa-list"></i> Categorias</a></li>
+                    <?php endif; ?>
+                    <li class="nav-item"><a class="nav-link active" href="productos.php"><i class="fas fa-box"></i> Productos</a></li>
+                    <li class="nav-item"><a class="nav-link" href="ventas.php"><i class="fas fa-shopping-cart"></i> Ventas</a></li>
+                    <li class="nav-item"><a class="nav-link" href="clientes.php"><i class="fas fa-users"></i> Clientes</a></li>
+                    <li class="nav-item"><a class="nav-link" href="reportes.php"><i class="fas fa-chart-line"></i> Reportes</a></li>
+                    <?php if ($_SESSION['rol'] === 'admin'): ?>
+                    <li class="nav-item"><a class="nav-link" href="usuarios.php"><i class="fas fa-user-shield"></i> Usuarios</a></li>
+                    <li class="nav-item"><a class="nav-link" href="configuracion.php"><i class="fas fa-cogs"></i> Configuración</a></li>
+                    <?php endif; ?>
+                    <li class="nav-item mt-3"><a class="nav-link text-danger" href="logout.php"><i class="fas fa-sign-out-alt"></i> Cerrar Sesión</a></li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Contenido principal -->
+        <div class="col-md-9 col-lg-10 p-3 p-md-4">
+
+            <div class="d-flex justify-content-between align-items-center mb-4">
+                <h2><i class="fas fa-box"></i> Productos</h2>
+                <div class="d-flex gap-2">
+                    <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#modalProducto">
+                        <i class="fas fa-plus"></i> Nuevo Producto
+                    </button>
+                    <button class="btn btn-success" data-bs-toggle="modal" data-bs-target="#modalActualizarStock">
+                        <i class="fas fa-box-open"></i> Actualizar Stock
+                    </button>
+                    <button class="btn btn-info" data-bs-toggle="modal" data-bs-target="#modalImportar">
+                        <i class="fas fa-file-csv"></i> Importar CSV
+                    </button>
+                    <a href="plantilla_productos.csv" class="btn btn-outline-secondary">
+                        <i class="fas fa-download"></i> Plantilla
+                    </a>
+                </div>
+            </div>
+
+            <?php if ($error): ?>
+                <div class="alert alert-danger alert-dismissible fade show" role="alert">
+                    <?= htmlspecialchars($error) ?>
+                    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                </div>
+            <?php endif; ?>
+            <?php if ($success || isset($_GET['eliminado']) || isset($_GET['exito'])): ?>
+                <div class="alert alert-success alert-dismissible fade show" role="alert">
+                    <?= $success ?: (isset($_GET['eliminado']) ? "Producto eliminado correctamente." : "Producto actualizado correctamente.") ?>
+                    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                </div>
+            <?php endif; ?>
+            <p class="text-muted">Agrega productos con sus imagenes, categorías, precios y stock. <br> Puedes además, actualizar y eliminar. E importar Stock de forma másiva, usando la plantilla CSV.</p>
+
+            <!-- Búsqueda -->
+            <form method="GET" class="mb-4">
+                <div class="input-group">
+                    <input type="text" class="form-control" name="busqueda" placeholder="Buscar por nombre o descripción..." 
+                           value="<?= htmlspecialchars($busqueda) ?>">
+                    <button class="btn btn-outline-secondary" type="submit">Buscar</button>
+                </div>
+            </form>
+
+            <!-- Lista de productos -->
+            <div class="row g-4">
+                <?php if ($productos): ?>
+                    <?php foreach ($productos as $p): ?>
+                    <div class="col-12 col-sm-6 col-md-6 col-lg-4">
+                        <div class="card">
+                            <?php if ($p['imagen_principal']): ?>
+                                <img src="uploads/productos/<?= htmlspecialchars($p['imagen_principal']) ?>" 
+                                     class="card-img-top" alt="<?= htmlspecialchars($p['nombre']) ?>">
+                            <?php else: ?>
+                                <div class="card-img-top d-flex align-items-center justify-content-center bg-light">
+                                    <i class="fas fa-image text-muted" style="font-size: 3rem;"></i>
+                                </div>
+                            <?php endif; ?>
+                            <div class="card-body">
+                                <h5 class="card-title"><?= htmlspecialchars($p['nombre']) ?></h5>
+                                <p class="text-muted small"><?= htmlspecialchars($p['descripcion'] ?? '') ?></p>
+                                <p><strong>Categoría:</strong> <?= htmlspecialchars($p['categoria_nombre'] ?? 'Sin categoría') ?></p>
+                                <p><strong>Precio:</strong> $<?= number_format($p['precio_venta'], 2) ?></p>
+                                <p><strong>Stock:</strong> 
+                                    <span class="<?= $p['stock'] <= $stock_minimo ? 'text-danger fw-bold' : '' ?>">
+                                        <?= $p['stock'] ?>
+                                        <?php if ($p['stock'] <= $stock_minimo): ?>
+                                            <i class="fas fa-exclamation-circle"></i>
+                                        <?php endif; ?>
+                                    </span>
+                                    <?= $p['estado'] == 'inactivo' ? '<span class="badge bg-secondary">Inactivo</span>' : '' ?>
+                                </p>
+                                <div class="d-flex gap-2">
+                                    <button type="button" class="btn btn-sm btn-outline-primary btn-tactil"
+                                            onclick="abrirEditarProducto(<?= $p['id'] ?>, '<?= addslashes($p['nombre']) ?>', '<?= $p['descripcion'] ?>', <?= $p['categoria_id'] ?>, <?= $p['precio_compra'] ?>, <?= $p['precio_venta'] ?>, <?= $p['stock'] ?>, '<?= $p['estado'] ?>')">
+                                        <i class="fas fa-edit"></i>
+                                    </button>
+                                    <a href="?eliminar=<?= $p['id'] ?>" class="btn btn-sm btn-outline-danger btn-tactil" 
+                                       onclick="return confirm('¿Eliminar este producto?')">
+                                        <i class="fas fa-trash"></i>
+                                    </a>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <?php endforeach; ?>
+                <?php else: ?>
+                    <div class="col-12">
+                        <div class="alert alert-info">No hay productos registrados.</div>
+                    </div>
+                <?php endif; ?>
+            </div>
+
+        </div>
+    </div>
+</div>
+
+<!-- Modal: Formulario de producto -->
+<div class="modal fade" id="modalProducto" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="tituloModalProducto">Nuevo Producto</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="POST" enctype="multipart/form-data" id="formProducto">
+                <input type="hidden" name="id" id="productoId">
+
+                <div class="modal-body">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <label class="form-label">Nombre *</label>
+                            <input type="text" name="nombre" id="nombreProducto" class="form-control" required>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">Categoría *</label>
+                            <select name="categoria_id" id="categoriaProducto" class="form-select" required>
+                                <option value="">-- Seleccionar --</option>
+                                <?php foreach ($categorias as $cat): ?>
+                                    <option value="<?= $cat['id'] ?>"><?= htmlspecialchars($cat['nombre']) ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">Precio Compra</label>
+                            <input type="number" step="0.01" name="precio_compra" id="precioCompraProducto" class="form-control">
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">Precio Venta *</label>
+                            <input type="number" step="0.01" name="precio_venta" id="precioVentaProducto" class="form-control" required>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">Stock</label>
+                            <input type="number" name="stock" id="stockProducto" class="form-control">
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">Estado</label>
+                            <select name="estado" id="estadoProducto" class="form-select">
+                                <option value="activo">Activo</option>
+                                <option value="inactivo">Inactivo</option>
+                            </select>
+                        </div>
+                        <div class="col-12">
+                            <label class="form-label">Descripción</label>
+                            <textarea name="descripcion" id="descripcionProducto" class="form-control" rows="3"></textarea>
+                        </div>
+                        <div class="col-12">
+                            <label class="form-label">Imágenes (múltiples, JPG/PNG)</label>
+                            <input type="file" name="imagenes[]" class="form-control" multiple accept="image/*">
+                            <small class="text-muted">Solo para nuevos productos o edición (se agregan a las existentes).</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="submit" class="btn btn-primary" id="btnGuardarProducto">Guardar Producto</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Modal: Actualizar Stock -->
+<div class="modal fade" id="modalActualizarStock" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Actualizar Stock</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="POST">
+                <input type="hidden" name="actualizar_stock" value="1">
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label">Producto *</label>
+                        <select name="producto_id" class="form-select" required>
+                            <option value="">-- Seleccionar producto --</option>
+                            <?php foreach ($productos as $p): ?>
+                                <option value="<?= $p['id'] ?>"><?= htmlspecialchars($p['nombre']) ?> (Stock: <?= $p['stock'] ?>)</option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Cantidad a agregar *</label>
+                        <input type="number" name="stock_aumento" class="form-control" min="1" required placeholder="Ej: 10">
+                        <small class="form-text text-muted">Se sumará al stock actual.</small>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="submit" class="btn btn-success">Actualizar Stock</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Modal: Importar CSV -->
+<div class="modal fade" id="modalImportar" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Importar Productos desde CSV</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="POST" enctype="multipart/form-data">
+                <div class="modal-body">
+                    <div class="alert alert-info">
+                        <p><strong>Formato del CSV:</strong></p>
+                        <ul class="mb-0">
+                            <li>Primera fila: <code>nombre,categoria,precio_compra,precio_venta,stock,estado,descripcion</code></li>
+                            <li><code>categoria</code>: debe coincidir con una categoría existente</li>
+                            <li><code>estado</code>: <code>activo</code> o <code>inactivo</code></li>
+                        </ul>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Archivo CSV *</label>
+                        <input type="file" name="archivo_csv" class="form-control" accept=".csv" required>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="submit" name="importar_csv" class="btn btn-info">
+                        <i class="fas fa-upload"></i> Importar
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+// Función para abrir el modal de edición con los datos del producto
+function abrirEditarProducto(id, nombre, descripcion, categoria_id, precio_compra, precio_venta, stock, estado) {
+    document.getElementById('tituloModalProducto').textContent = 'Editar Producto';
+    document.getElementById('productoId').value = id;
+    document.getElementById('nombreProducto').value = nombre;
+    document.getElementById('descripcionProducto').value = descripcion || '';
+    document.getElementById('categoriaProducto').value = categoria_id;
+    document.getElementById('precioCompraProducto').value = precio_compra || 0;
+    document.getElementById('precioVentaProducto').value = precio_venta;
+    document.getElementById('stockProducto').value = stock || 0;
+    document.getElementById('estadoProducto').value = estado;
+    document.getElementById('btnGuardarProducto').textContent = 'Actualizar Producto';
+    
+    const modal = new bootstrap.Modal(document.getElementById('modalProducto'));
+    modal.show();
+}
+
+// Botón "Nuevo Producto" limpia el formulario
+document.querySelector('[data-bs-target="#modalProducto"]').addEventListener('click', () => {
+    document.getElementById('tituloModalProducto').textContent = 'Nuevo Producto';
+    document.getElementById('formProducto').reset();
+    document.getElementById('productoId').value = '';
+    document.getElementById('btnGuardarProducto').textContent = 'Guardar Producto';
+});
+</script>
+
+</body>
+</html>
